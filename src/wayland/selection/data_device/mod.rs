@@ -638,6 +638,53 @@ where
     seat_data.borrow_mut().set_clipboard_focus::<D>(dh, client);
 }
 
+/// Return this client's regular data devices on a seat, excluding both data-control protocols.
+///
+/// This does not change selection ownership or focus. Callers sending private offers must
+/// validate focus, manage their lifetime, and never treat this client scope as widget scope.
+pub fn client_data_devices<D>(
+    seat: &Seat<D>,
+    client: &Client,
+) -> Vec<wayland_server::protocol::wl_data_device::WlDataDevice>
+where
+    D: SelectionHandler + 'static,
+{
+    let Some(data) = seat.user_data().get::<RefCell<SeatData<D::SelectionUserData>>>() else {
+        return Vec::new();
+    };
+    data.borrow()
+        .known_data_devices()
+        .filter(|device| device.is_alive() && device.client().as_ref() == Some(client))
+        .cloned()
+        .collect()
+}
+
+/// An opaque change counter for the real clipboard selection, including clears.
+///
+/// Focus changes and re-offering do not advance the counter. It wraps on overflow.
+pub fn data_device_selection_serial<D>(seat: &Seat<D>) -> u64
+where
+    D: SelectionHandler + 'static,
+{
+    seat.user_data()
+        .get::<RefCell<SeatData<D::SelectionUserData>>>()
+        .map_or(0, |data| data.borrow().clipboard_serial)
+}
+
+/// Re-offer the current real clipboard to the focused client's regular data devices.
+///
+/// Does not cancel, replace or clone the selection source, change focus, or notify data-control
+/// devices. In particular, it can remove a private offer sent directly to regular data devices.
+pub fn resend_data_device_selection<D>(dh: &DisplayHandle, seat: &Seat<D>)
+where
+    D: SelectionHandler + 'static,
+{
+    if let Some(data) = seat.user_data().get::<RefCell<SeatData<D::SelectionUserData>>>() {
+        data.borrow_mut()
+            .send_selection::<D>(dh, super::SelectionTarget::Clipboard, None, false);
+    }
+}
+
 /// Set a compositor-provided selection for this seat
 ///
 /// You need to provide the available mime types for this selection.

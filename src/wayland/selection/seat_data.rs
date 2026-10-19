@@ -12,6 +12,7 @@ use super::{SelectionHandler, SelectionTarget};
 pub(crate) struct SeatData<U: Clone + Sync + Send + 'static> {
     known_devices: Vec<SelectionDevice>,
     clipboard_selection: Option<OfferReplySource<U>>,
+    pub(crate) clipboard_serial: u64,
     clipboard_selection_focus: Option<Client>,
     primary_selection: Option<OfferReplySource<U>>,
     primary_selection_focus: Option<Client>,
@@ -63,6 +64,7 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
     ) where
         D: SelectionHandler<SelectionUserData = U> + 'static,
     {
+        self.clipboard_serial = self.clipboard_serial.wrapping_add(1);
         if let Some(OfferReplySource::Client(source)) = self.clipboard_selection.as_ref() {
             match new_selection.as_ref() {
                 Some(OfferReplySource::Client(new_source)) if new_source == source => (),
@@ -220,6 +222,7 @@ impl<U: Clone + Send + Sync + 'static> Default for SeatData<U> {
         Self {
             known_devices: Vec::new(),
             clipboard_selection: None,
+            clipboard_serial: 0,
             clipboard_selection_focus: None,
             primary_selection: None,
             primary_selection_focus: None,
