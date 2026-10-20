@@ -59,6 +59,7 @@ use crate::{
     wayland::{Dispatch2, GlobalData, GlobalDispatch2},
 };
 
+pub use text_input_handle::TextInputContext;
 pub use text_input_handle::TextInputHandle;
 pub use text_input_handle::TextInputUserData;
 
@@ -167,7 +168,7 @@ where
                     },
                 );
                 handle.add_instance(&instance);
-                if input_method_handle.has_instance() {
+                if input_method_handle.has_instance() || handle.compositor_input_method() {
                     handle.enter();
                 }
             }

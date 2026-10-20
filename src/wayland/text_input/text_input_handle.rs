@@ -1,3 +1,4 @@
+use std::fmt;
 use std::mem;
 use std::sync::{Arc, Mutex};
 
@@ -67,6 +68,41 @@ pub struct TextInputHandle {
     pub(crate) inner: Arc<Mutex<TextInput>>,
 }
 
+/// The committed state of the active, focused text input.
+///
+/// Surrounding text is optional, UTF-8 encoded, and uses byte offsets. The
+/// activation serial distinguishes different fields sharing one protocol object.
+/// This accessor does not acknowledge a client commit or take an input-method slot.
+#[derive(Clone)]
+pub struct TextInputContext {
+    /// Active protocol object.
+    pub text_input: ZwpTextInputV3,
+    /// Focused surface associated with the state.
+    pub surface: WlSurface,
+    /// Most recent client commit serial, including commits without text changes.
+    pub serial: u32,
+    /// Client commit serial of the most recent enable request.
+    pub activation_serial: u32,
+    /// Surrounding plain text, cursor offset and selection anchor offset.
+    pub surrounding_text: Option<(String, u32, u32)>,
+    /// Content hints and purpose, if supplied by the application.
+    pub content_type: Option<(ContentHint, ContentPurpose)>,
+}
+
+impl fmt::Debug for TextInputContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TextInputContext")
+            .field("serial", &self.serial)
+            .field("activation_serial", &self.activation_serial)
+            .field(
+                "surrounding_text",
+                &self.surrounding_text.as_ref().map(|_| "<redacted>"),
+            )
+            .field("content_type", &self.content_type)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TextInputHandle {
     pub(super) fn add_instance(&self, instance: &ZwpTextInputV3) {
         let mut inner = self.inner.lock().unwrap();
@@ -74,6 +110,7 @@ impl TextInputHandle {
             instance: instance.clone(),
             serial: 0,
             pending_state: Default::default(),
+            committed: Default::default(),
         });
     }
 
@@ -99,7 +136,14 @@ impl TextInputHandle {
     ///
     /// This doesn't send any 'enter' or 'leave' events.
     pub fn set_focus(&self, surface: Option<WlSurface>) {
-        self.inner.lock().unwrap().focus = surface;
+        let mut inner = self.inner.lock().unwrap();
+        if inner.focus != surface {
+            inner.active_text_input_id = None;
+            for instance in &mut inner.instances {
+                instance.committed = Default::default();
+            }
+        }
+        inner.focus = surface;
     }
 
     /// Send `leave` on the text-input instance for the currently focused
@@ -108,6 +152,9 @@ impl TextInputHandle {
         let mut inner = self.inner.lock().unwrap();
         // Leaving clears the active text input.
         inner.active_text_input_id = None;
+        for instance in &mut inner.instances {
+            instance.committed = Default::default();
+        }
         // NOTE: we implement it in a symmetrical way with `enter`.
         inner.with_focused_client_all_text_inputs(|text_input, focus, _| {
             text_input.leave(focus);
@@ -132,12 +179,8 @@ impl TextInputHandle {
     /// remote-desktop text injection). Toggling this sends `enter`/`leave` for the current
     /// focus immediately; subsequent focus changes are handled by the keyboard focus logic.
     pub fn set_compositor_input_method(&self, active: bool) {
-        {
-            let mut inner = self.inner.lock().unwrap();
-            if inner.compositor_input_method == active {
-                return;
-            }
-            inner.compositor_input_method = active;
+        if !self.update_compositor_input_method(active) {
+            return;
         }
         if active {
             self.enter();
@@ -146,10 +189,44 @@ impl TextInputHandle {
         }
     }
 
+    /// Change compositor input-method state without sending focus notifications.
+    ///
+    /// Returns whether the state changed. Compositors sharing mediation with a
+    /// real input method can call `enter`/`leave` only when that method is absent.
+    pub fn update_compositor_input_method(&self, active: bool) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let changed = inner.compositor_input_method != active;
+        inner.compositor_input_method = active;
+        changed
+    }
+
     /// Whether the compositor is currently acting as the input method for this seat
     /// (see [`set_compositor_input_method`](Self::set_compositor_input_method)).
     pub fn compositor_input_method(&self) -> bool {
         self.inner.lock().unwrap().compositor_input_method
+    }
+
+    /// Read the committed context of the active text input on the focused surface.
+    ///
+    /// Returns `None` before enable, after disable/leave, or after destruction.
+    /// Pending requests are invisible until the application commits them.
+    pub fn current_context(&self) -> Option<TextInputContext> {
+        let inner = self.inner.lock().unwrap();
+        let surface = inner.focus.as_ref().filter(|surface| surface.is_alive())?;
+        let active = inner.active_text_input_id.as_ref()?;
+        let instance = inner.instances.iter().find(|instance| {
+            instance.instance.is_alive()
+                && instance.instance.id() == *active
+                && instance.instance.id().same_client_as(&surface.id())
+        })?;
+        Some(TextInputContext {
+            text_input: instance.instance.clone(),
+            surface: surface.clone(),
+            serial: instance.serial,
+            activation_serial: instance.committed.activation_serial,
+            surrounding_text: instance.committed.surrounding_text.clone(),
+            content_type: instance.committed.content_type,
+        })
     }
 
     /// The `discard_state` is used when the input-method signaled that
@@ -293,23 +370,32 @@ where
             zwp_text_input_v3::Request::Commit => {
                 let mut new_state = mem::take(pending_state);
                 let _ = pending_state;
-                let active_text_input_id = &mut guard.active_text_input_id;
-
-                if active_text_input_id.is_some() && *active_text_input_id != Some(resource.id()) {
+                if guard.active_text_input_id.is_some() && guard.active_text_input_id != Some(resource.id()) {
                     debug!("discarding text_input request since we already have an active one");
                     return;
                 }
 
+                if new_state.enable.is_none() && guard.active_text_input_id != Some(resource.id()) {
+                    debug!("discarding text_input requests before enabling it");
+                    return;
+                }
+                let instance = guard
+                    .instances
+                    .iter_mut()
+                    .find(|instance| instance.instance == *resource)
+                    .unwrap();
+                instance.committed.apply(&new_state, instance.serial);
+
                 match new_state.enable {
                     Some(true) => {
-                        *active_text_input_id = Some(resource.id());
+                        guard.active_text_input_id = Some(resource.id());
                         // Drop the guard before calling to other subsystem.
                         drop(guard);
                         self.input_method_handle.activate_input_method(state, &focus);
                         state.activated(new_state.content_type);
                     }
                     Some(false) => {
-                        *active_text_input_id = None;
+                        guard.active_text_input_id = None;
                         // Drop the guard before calling to other subsystem.
                         drop(guard);
                         self.input_method_handle.deactivate_input_method(state);
@@ -317,11 +403,6 @@ where
                         return;
                     }
                     None => {
-                        if *active_text_input_id != Some(resource.id()) {
-                            debug!("discarding text_input requests before enabling it");
-                            return;
-                        }
-
                         // Drop the guard before calling to other subsystems later on.
                         drop(guard);
                     }
@@ -393,6 +474,45 @@ struct Instance {
     instance: ZwpTextInputV3,
     serial: u32,
     pending_state: TextInputState,
+    committed: CommittedContext,
+}
+
+#[derive(Default)]
+struct CommittedContext {
+    activation_serial: u32,
+    surrounding_text: Option<(String, u32, u32)>,
+    content_type: Option<(ContentHint, ContentPurpose)>,
+}
+
+impl fmt::Debug for CommittedContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CommittedContext")
+            .field("activation_serial", &self.activation_serial)
+            .field(
+                "surrounding_text",
+                &self.surrounding_text.as_ref().map(|_| "<redacted>"),
+            )
+            .field("content_type", &self.content_type)
+            .finish()
+    }
+}
+
+impl CommittedContext {
+    fn apply(&mut self, pending: &TextInputState, serial: u32) {
+        if let Some(enable) = pending.enable {
+            *self = Self::default();
+            if !enable {
+                return;
+            }
+            self.activation_serial = serial;
+        }
+        if let Some(text) = &pending.surrounding_text {
+            self.surrounding_text = Some(text.clone());
+        }
+        if let Some(content_type) = pending.content_type {
+            self.content_type = Some(content_type);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -402,4 +522,45 @@ struct TextInputState {
     content_type: Option<(ContentHint, ContentPurpose)>,
     cursor_rectangle: Option<Rectangle<i32, Logical>>,
     text_change_cause: Option<ChangeCause>,
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn context_preserves_partial_commits_and_resets_on_field_changes() {
+        let mut context = CommittedContext::default();
+        context.apply(
+            &TextInputState {
+                enable: Some(true),
+                surrounding_text: Some(("Hello 🌍".into(), 6, 10)),
+                content_type: Some((ContentHint::None, ContentPurpose::Normal)),
+                ..Default::default()
+            },
+            1,
+        );
+        context.apply(&TextInputState::default(), 2);
+        assert_eq!(context.activation_serial, 1);
+        assert_eq!(context.surrounding_text, Some(("Hello 🌍".into(), 6, 10)));
+        context.apply(
+            &TextInputState {
+                enable: Some(true),
+                ..Default::default()
+            },
+            3,
+        );
+        assert_eq!(context.activation_serial, 3);
+        assert!(context.surrounding_text.is_none());
+        assert!(context.content_type.is_none());
+        context.apply(
+            &TextInputState {
+                enable: Some(false),
+                ..Default::default()
+            },
+            4,
+        );
+        assert_eq!(context.activation_serial, 0);
+        assert!(context.surrounding_text.is_none());
+    }
 }
